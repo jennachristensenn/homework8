@@ -1,0 +1,275 @@
+---
+title: "Basic Modeling"
+format: html
+editor: visual
+author: Jenna Christensen
+---
+
+```{r, warning = FALSE, message = FALSE}
+library(tidyverse)
+library(lubridate)
+library(tidymodels)
+```
+
+## Reading in Data
+
+Here I am using encoding = "EUC-KR" to deal with the file that includes non-ASCII characters such as "Temperature(캜)".
+```{r}
+bike_data <- readr::read_csv("SeoulBikeData.csv", locale = readr::locale(encoding = "EUC-KR"))
+```
+
+Renaming variables so they are easy to use, changing certain variables to factors, and adjusting the date format so that all column types are as they should be. 
+```{r}
+bike_data <- bike_data |>
+  rename("date" = "Date",
+         "rent_bike" = "Rented Bike Count",
+         "hour" = "Hour",
+         "temp" = "Temperature(캜)",
+         "humid" = "Humidity(%)",
+         "wind" = "Wind speed (m/s)",
+         "vis" = "Visibility (10m)",
+         "dew_point" = "Dew point temperature(캜)",
+         "solar_rad" = "Solar Radiation (MJ/m2)",
+         "rain" = "Rainfall(mm)",
+         "snow" = "Snowfall (cm)",
+         "season" = "Seasons",
+         "holiday" = "Holiday",
+         "fun_day" = "Functioning Day") |>
+  mutate(across(c(season, holiday, fun_day), as.factor), date = dmy(date))
+bike_data
+```
+
+## EDA
+
+Checking for missing values, there does not appear to be any.
+```{r}
+sum_na <- function(column){
+ sum(is.na(column))
+}
+na_counts <- bike_data |>
+ summarize(across(everything(), sum_na))
+
+na_counts
+```
+
+Basic summary stats for numeric variables and unique values and counts for character variables. It appears that bike rental counts have a standard deviation that's almost the same values as the mean. 
+```{r}
+bike_summary <- bike_data |>
+  summarize(across(where(is.numeric),list(mean = mean,
+                                          median = median,
+                                          min = min,
+                                          max = max,
+                                          sd = sd)),
+            across(where(is.factor), ~ length(unique(.)),.names = "unique_{.col}")
+  )
+bike_summary
+```
+
+Exploring contingency tables for categorical variables. Going to remove the rows that fall under a "no functional hours" day. 
+```{r}
+season_count <- table(bike_data$season)
+season_count
+
+holiday_count <- table(bike_data$holiday)
+holiday_count
+
+fun_count <- table(bike_data$fun_day)
+fun_count
+```
+
+Creating the final dataset by grouping by selected variables, and using the sum or mean of other variables.
+```{r}
+bike_data <- bike_data |>
+  filter(fun_day != "no") |>
+  group_by(date, season, holiday) |>
+  summarize(total_rent_bike = sum(rent_bike),
+            total_rain = sum(rain),
+            total_snow = sum(snow),
+            mean_temp = mean(temp),
+            mean_humid = mean(humid),
+            mean_wind = mean(wind),
+            mean_vis = mean(vis),
+            mean_dew_point = mean(dew_point),
+            mean_solar_rad = mean(solar_rad))
+bike_data
+```
+
+Recreating summary stats on final dataset.
+```{r}
+final_summary <- bike_data |>
+  summarize(across(where(is.numeric),list(mean = mean,
+                                          median = median,
+                                          min = min,
+                                          max = max,
+                                          sd = sd)),
+            across(where(is.factor), ~ length(unique(.)),.names = "unique_{.col}")
+  )
+final_summary
+```
+
+Exploring plots to see relationships. It makes sense that we see the most bikes being rented in summer months. 
+```{r}
+ggplot(data = bike_data, aes(x = season, fill = holiday)) +
+  geom_bar(position = "dodge") +
+  labs(x = "Season", title = "Season and Holiday") + 
+  scale_fill_discrete("Holiday")
+
+ggplot(data = bike_data, aes(x = total_rent_bike)) +
+  geom_histogram(binwidth = 500, alpha = 0.7) +
+  labs(x = "Total Bikes Rented", title = "Total Bikes Rented") 
+
+ggplot(data = bike_data, aes(x = total_rent_bike, y = mean_temp, color = season)) +
+  geom_point() +
+  labs(x = "Total Bikes Rented", y = "Mean Temperature", title = "Bikes Rented and Temperature by Season") +
+  scale_color_discrete("Season")
+
+ggplot(data = bike_data, aes(x = total_rent_bike, y = mean_vis, color = season)) +
+  geom_point() +
+  labs(x = "Total Bikes Rented", y = "Mean Visibility", title = "Bikes Rented and Visibility by Season") +
+  scale_color_discrete("Season")
+```
+
+Finding correlation between numeric variables.Beyone dew point and temperature (which is expected to have a high correlation) none of the variables have a particularly strong positive or negative correlation.
+```{r}
+num_data <- bike_data |> 
+  ungroup() |>
+  select(where(is.numeric))
+
+cor_mat <- cor(num_data, use = "complete.obs")
+cor_mat
+
+```
+
+## Splitting the Data
+
+Using functions from tidymodels to split the data and add in the stratification. Then applying 10-fold cross validation to the training set.
+```{r}
+bike_split <- initial_split(bike_data, prop = 0.75, strata = season)
+bike_train <- training(bike_split)
+bike_test <- testing(bike_split)
+bike_10_fold <- vfold_cv(bike_train, 10)
+```
+
+## Fitting MLR Models 
+
+Creating the first recipe. 
+```{r}
+bike_recipe1 <-recipe(total_rent_bike ~ ., data = bike_data) |>
+  update_role(date, new_role = "ID") |>
+  step_mutate(day_type = factor(if_else(date %>% lubridate::wday(label = TRUE) %in% c("Sun", "Sat"), "weekend", "weekday"))) |>
+  step_normalize(total_rain,
+                 total_snow,
+                 mean_temp,
+                 mean_humid,
+                 mean_wind,
+                 mean_vis,
+                 mean_dew_point, 
+                 mean_solar_rad) |>
+  step_dummy(season, holiday, day_type)
+
+bike_recipe1
+```
+
+Creating the second recipe, adding in interactions.
+```{r}
+bike_recipe2 <- recipe(total_rent_bike ~ ., data = bike_data) |>
+  update_role(date, new_role = "ID") |>
+  step_mutate(day_type = factor(if_else(date %>% lubridate::wday(label = TRUE) %in% c("Sun", "Sat"), "weekend", "weekday"))) |>
+  step_normalize(total_rain,
+                 total_snow,
+                 mean_temp,
+                 mean_humid,
+                 mean_wind,
+                 mean_vis,
+                 mean_dew_point, 
+                 mean_solar_rad) |>
+  step_dummy(season, holiday, day_type) |>
+  step_interact(terms = ~ starts_with("season")*starts_with("holiday")) |>
+  step_interact(terms = ~ starts_with("season")*mean_temp) |>
+  step_interact(terms = ~ mean_temp*total_rain)
+
+bike_recipe2
+```
+
+Creating the third recipe, adding in the quadratic terms.
+```{r}
+bike_recipe3 <- recipe(total_rent_bike ~ ., data = bike_data) |>
+  update_role(date, new_role = "ID") |>
+  step_mutate(day_type = factor(if_else(date %>% lubridate::wday(label = TRUE) %in% c("Sun", "Sat"), "weekend", "weekday"))) |>
+  step_normalize(total_rain,
+                 total_snow,
+                 mean_temp,
+                 mean_humid,
+                 mean_wind,
+                 mean_vis,
+                 mean_dew_point, 
+                 mean_solar_rad) |>
+  step_dummy(season, holiday, day_type) |>
+  step_interact(terms = ~ starts_with("season")*starts_with("holiday")) |>
+  step_interact(terms = ~ starts_with("season")*mean_temp) |>
+  step_interact(terms = ~ mean_temp*total_rain) |>
+  step_poly(total_rain,
+            total_snow,
+            mean_temp,
+            mean_humid,
+            mean_wind,
+            mean_vis,
+            mean_dew_point, 
+            mean_solar_rad,
+            degree = 2)
+
+bike_recipe3
+```
+
+Setting up the linear model fit and fitting the models to determine best performance. It appears that model 3 has a smaller RMSE and high R-squared value so that would be the best fit. 
+```{r}
+bike_mod <- linear_reg() |>
+  set_engine("lm")
+
+bike_wfl <- workflow() |>
+  add_recipe(bike_recipe1) |>
+  add_model(bike_mod) |>
+  fit_resamples(bike_10_fold)
+
+bike_wfl2 <- workflow() |>
+  add_recipe(bike_recipe2) |>
+  add_model(bike_mod)|>
+  fit_resamples(bike_10_fold)
+
+bike_wfl3 <- workflow() |>
+  add_recipe(bike_recipe3) |>
+  add_model(bike_mod)|>
+  fit_resamples(bike_10_fold)
+
+rbind(bike_wfl |> collect_metrics() |> mutate(workflow = "bike_wfl1"),
+      bike_wfl2 |> collect_metrics() |> mutate(workflow = "bike_wfl2"),
+      bike_wfl3 |> collect_metrics() |> mutate(workflow = "bike_wfl3"))
+```
+
+Using the chosen model on the full training and test data. 
+```{r}
+bike_wfl3 <- workflow() |>
+  add_recipe(bike_recipe3) |>
+  add_model(bike_mod)
+
+final_fit <- last_fit(bike_wfl3, bike_split)
+final_metrics <- final_fit |> collect_metrics()
+final_metrics
+
+final_model <- final_fit |>
+  extract_fit_parsnip()
+model_coef <- tidy(final_model)
+model_coef
+  
+
+```
+
+
+
+
+
+
+
+
+
+
